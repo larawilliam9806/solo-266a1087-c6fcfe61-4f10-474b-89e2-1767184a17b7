@@ -11,6 +11,7 @@ from .normalization import (
     parse_reference,
     parse_tsv,
     validate_and_normalize,
+    validate_and_normalize_fragment,
 )
 
 
@@ -54,8 +55,12 @@ def upload_reference(raw: bytes) -> dict:
     }
 
 
-def upload_sample(name: str, raw: bytes) -> dict:
-    """上传（或同名重传）一份样本 TSV。
+def upload_sample(name: str, raw: bytes, fragment_raw: bytes | None = None) -> dict:
+    """上传（或同名重传）一份样本 TSV，可附片段参考。
+
+    fragment_raw 不为 None 时，TSV 按片段编号：先在当前全长参考上定位
+    片段（唯一正/反向匹配），按片段核对 REF 与范围，换算为全长正向表示
+    后再归一化判重；片段序列随样本留存，供换参考后重新定位重验。
 
     重传时先完整校验新文件，成功才替换旧版本；旧变体在同一事务中删除、
     新变体写入，任何错误整体回滚，当前结果不受影响。
@@ -69,6 +74,11 @@ def upload_sample(name: str, raw: bytes) -> dict:
     # 解析在事务外完成（不触碰数据库，不影响现有结果）
     rows = parse_tsv(raw)
     raw_text = raw.decode("utf-8")
+    fragment = (
+        parse_reference(fragment_raw, what="片段参考")
+        if fragment_raw is not None
+        else None
+    )
 
     with write_tx() as conn:
         ref_row = conn.execute(
@@ -78,8 +88,15 @@ def upload_sample(name: str, raw: bytes) -> dict:
             raise ValidationError("请先上传参考序列，再上传样本。")
         ref_id, ref_seq = ref_row["id"], ref_row["sequence"]
 
-        # 校验 + 左对齐 + 去冗余；失败抛 ValidationError，事务回滚
-        variants = validate_and_normalize(rows, ref_seq)
+        # 校验 + （片段模式先定位换算）+ 左对齐 + 去冗余；失败抛 ValidationError，事务回滚
+        if fragment is not None:
+            variants, location = validate_and_normalize_fragment(
+                rows, fragment, ref_seq
+            )
+            frag_start, frag_end, frag_strand = location
+        else:
+            variants = validate_and_normalize(rows, ref_seq)
+            frag_start = frag_end = frag_strand = None
 
         old = conn.execute("SELECT id FROM samples WHERE name=?", (name,)).fetchone()
         if old is not None:
@@ -87,14 +104,21 @@ def upload_sample(name: str, raw: bytes) -> dict:
             conn.execute("DELETE FROM samples WHERE id=?", (old["id"],))
 
         cur = conn.execute(
-            "INSERT INTO samples (name, reference_id, status, error, raw_tsv) "
-            "VALUES (?, ?, 'VALID', NULL, ?)",
-            (name, ref_id, raw_text),
+            "INSERT INTO samples (name, reference_id, status, error, raw_tsv, "
+            "fragment_seq, frag_start, frag_end, frag_strand) "
+            "VALUES (?, ?, 'VALID', NULL, ?, ?, ?, ?, ?)",
+            (name, ref_id, raw_text, fragment, frag_start, frag_end, frag_strand),
         )
         sample_id = cur.lastrowid
         _insert_variants(conn, sample_id, variants)
 
-    return {"sample": name, "count": len(variants), "replaced": old is not None}
+    location_info = (frag_start, frag_end, frag_strand) if fragment is not None else None
+    return {
+        "sample": name,
+        "count": len(variants),
+        "replaced": old is not None,
+        "fragment": location_info,
+    }
 
 
 def delete_sample(sample_id: int) -> None:
@@ -105,18 +129,29 @@ def delete_sample(sample_id: int) -> None:
 def _revalidate_sample(
     conn: sqlite3.Connection, sample_id: int, ref_id: int, ref_seq: str
 ) -> bool:
-    """按给定参考重新校验一个样本，返回是否通过。"""
+    """按给定参考重新校验一个样本，返回是否通过。
+
+    片段样本用留存的片段序列与原 TSV 在新参考上重新定位并重验；
+    定位失败（无匹配/不唯一）或行校验失败同样标记为待重传。
+    """
     row = conn.execute(
-        "SELECT raw_tsv FROM samples WHERE id=?", (sample_id,)
+        "SELECT raw_tsv, fragment_seq FROM samples WHERE id=?", (sample_id,)
     ).fetchone()
     try:
         rows = parse_tsv(row["raw_tsv"])
-        variants = validate_and_normalize(rows, ref_seq)
+        if row["fragment_seq"]:
+            variants, (frag_start, frag_end, frag_strand) = (
+                validate_and_normalize_fragment(rows, row["fragment_seq"], ref_seq)
+            )
+        else:
+            variants = validate_and_normalize(rows, ref_seq)
+            frag_start = frag_end = frag_strand = None
     except ValidationError as exc:
         conn.execute("DELETE FROM sample_variants WHERE sample_id=?", (sample_id,))
         conn.execute(
-            "UPDATE samples SET reference_id=?, status='NEEDS_REUPLOAD', "
-            "error=?, revalidated_at=datetime('now') WHERE id=?",
+            "UPDATE samples SET reference_id=?, status='NEEDS_REUPLOAD', error=?, "
+            "frag_start=NULL, frag_end=NULL, frag_strand=NULL, "
+            "revalidated_at=datetime('now') WHERE id=?",
             (ref_id, str(exc), sample_id),
         )
         return False
@@ -124,8 +159,9 @@ def _revalidate_sample(
     conn.execute("DELETE FROM sample_variants WHERE sample_id=?", (sample_id,))
     conn.execute(
         "UPDATE samples SET reference_id=?, status='VALID', error=NULL, "
+        "frag_start=?, frag_end=?, frag_strand=?, "
         "revalidated_at=datetime('now') WHERE id=?",
-        (ref_id, sample_id),
+        (ref_id, frag_start, frag_end, frag_strand, sample_id),
     )
     _insert_variants(conn, sample_id, variants)
     return True
@@ -211,7 +247,9 @@ def get_variant_detail(pos: int, ref: str, alt: str) -> dict | None:
         if current is None:
             return None
         rows = conn.execute(
-            "SELECT s.name AS sample, v.gt, v.orig_pos, v.orig_ref, v.orig_alt, v.kind "
+            "SELECT s.name AS sample, v.gt, v.orig_pos, v.orig_ref, v.orig_alt, v.kind, "
+            "s.fragment_seq IS NOT NULL AS is_fragment, "
+            "s.frag_start, s.frag_end, s.frag_strand "
             "FROM sample_variants v "
             "JOIN samples s ON s.id = v.sample_id "
             "WHERE v.pos=? AND v.ref=? AND v.alt=? "

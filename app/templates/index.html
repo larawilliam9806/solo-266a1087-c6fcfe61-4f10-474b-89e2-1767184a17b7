@@ -25,9 +25,14 @@
 <section class="card">
   <h2>上传样本 TSV</h2>
   <p class="hint">列：<code>POS（从 1 计数）&nbsp;REF&nbsp;ALT&nbsp;GT</code>，Tab 分隔，可带表头。同名样本重传会替换旧版。</p>
+  <p class="hint">若 TSV 按片段编号，可附该片段的 ACGT 序列（按 TSV 所用链方向书写，支持纯文本或单记录 FASTA）。
+    系统会在全长参考上查找唯一的正/反向匹配，先按片段核对 REF 与范围，再换算为全长正向坐标后归一化；
+    不附片段时 TSV 按全长参考坐标处理。</p>
   <form method="post" action="{{ url_for('upload_sample') }}" enctype="multipart/form-data" class="upload">
     <input type="text" name="name" placeholder="样本名称，如 S1" maxlength="128" required>
     <input type="file" name="sample" accept=".tsv,.txt,text/tab-separated-values" required>
+    <input type="file" name="fragment" accept=".fa,.fasta,.txt,.seq,text/plain"
+           title="可选：片段参考序列（按 TSV 所用链方向书写的 ACGT）">
     <button type="submit" class="primary">上传样本</button>
   </form>
 </section>
@@ -41,7 +46,7 @@
   </p>
   {% if samples %}
   <table>
-    <thead><tr><th>样本</th><th>状态</th><th>变异数</th><th>上传时间</th><th>说明</th><th></th></tr></thead>
+    <thead><tr><th>样本</th><th>状态</th><th>坐标</th><th>变异数</th><th>上传时间</th><th>说明</th><th></th></tr></thead>
     <tbody>
     {% for s in samples %}
       <tr class="{{ 'row-warn' if s.status == 'NEEDS_REUPLOAD' or s.reference_id != reference.id }}">
@@ -53,6 +58,17 @@
             <span class="tag tag-ok">有效</span>
           {% else %}
             <span class="tag tag-bad">待重传</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if s.fragment_seq %}
+            {% if s.frag_start %}
+              <span class="tag tag-kind">片段 {{ s.frag_start }}-{{ s.frag_end }}（{{ s.frag_strand }}）</span>
+            {% else %}
+              <span class="tag tag-stale">片段（未定位）</span>
+            {% endif %}
+          {% else %}
+            全长
           {% endif %}
         </td>
         <td>{{ s.variant_count }}</td>

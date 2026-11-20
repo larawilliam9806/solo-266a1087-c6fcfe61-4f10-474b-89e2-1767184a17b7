@@ -62,17 +62,27 @@ def create_app() -> Flask:
         if file is None or not file.filename:
             flash("请选择样本 TSV 文件。", "error")
             return redirect(url_for("index"))
+        fragment_file = request.files.get("fragment")
+        fragment_raw = (
+            fragment_file.read()
+            if fragment_file is not None and fragment_file.filename
+            else None
+        )
         try:
-            result = services.upload_sample(name, file.read())
+            result = services.upload_sample(name, file.read(), fragment_raw)
         except ValidationError as exc:
             flash(f"样本上传失败，当前结果未改变：{exc}", "error")
             return redirect(url_for("index"))
         action = "替换旧版本" if result["replaced"] else "新建"
-        flash(
+        message = (
             f"样本「{result['sample']}」{action}成功，"
-            f"归一化后 {result['count']} 条变异。",
-            "success",
+            f"归一化后 {result['count']} 条变异。"
         )
+        if result["fragment"] is not None:
+            fstart, fend, fstrand = result["fragment"]
+            strand = "正向" if fstrand == "+" else "反向"
+            message += f"片段定位：全长 {fstart}-{fend}（{strand}）。"
+        flash(message, "success")
         return redirect(url_for("index"))
 
     @app.post("/samples/<int:sample_id>/delete")

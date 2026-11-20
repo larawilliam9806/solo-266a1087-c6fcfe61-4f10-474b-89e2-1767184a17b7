@@ -78,6 +78,10 @@ CREATE TABLE IF NOT EXISTS samples (
     status            TEXT NOT NULL CHECK (status IN ('VALID', 'NEEDS_REUPLOAD')),
     error             TEXT,
     raw_tsv           TEXT NOT NULL,
+    fragment_seq      TEXT,
+    frag_start        INTEGER,
+    frag_end          INTEGER,
+    frag_strand       TEXT,
     uploaded_at       TEXT NOT NULL DEFAULT (datetime('now')),
     revalidated_at    TEXT
 );
@@ -100,11 +104,23 @@ CREATE INDEX IF NOT EXISTS idx_variant_canonical
 CREATE INDEX IF NOT EXISTS idx_variant_sample ON sample_variants(sample_id);
 """
 
+# 既有库（无片段列）的增量迁移：samples 表缺少哪列就补哪列。
+_MIGRATIONS = (
+    ("fragment_seq", "ALTER TABLE samples ADD COLUMN fragment_seq TEXT"),
+    ("frag_start", "ALTER TABLE samples ADD COLUMN frag_start INTEGER"),
+    ("frag_end", "ALTER TABLE samples ADD COLUMN frag_end INTEGER"),
+    ("frag_strand", "ALTER TABLE samples ADD COLUMN frag_strand TEXT"),
+)
+
 
 def init_db(app: Flask) -> None:
     conn = sqlite3.connect(app.config["DATABASE"])
     try:
         conn.executescript(SCHEMA)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(samples)")}
+        for col, ddl in _MIGRATIONS:
+            if col not in cols:
+                conn.execute(ddl)
         conn.commit()
     finally:
         conn.close()

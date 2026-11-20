@@ -19,36 +19,43 @@ ACGT = frozenset("ACGT")
 VALID_GTS = ("0/1", "1/1")
 MAX_NAME_LEN = 128
 
+_COMP_TABLE = str.maketrans("ACGT", "TGCA")
+
 
 class ValidationError(Exception):
     """输入数据不合法；message 可直接展示给用户。"""
 
 
+def revcomp(seq: str) -> str:
+    """返回 ACGT 序列的反向互补序列。"""
+    return seq.translate(_COMP_TABLE)[::-1]
+
+
 # --------------------------------------------------------------------------- #
 # 参考序列
 # --------------------------------------------------------------------------- #
-def parse_reference(raw: bytes | str) -> str:
-    """解析参考序列上传内容，支持纯文本和单记录 FASTA。仅接受大写 ACGT。"""
+def parse_reference(raw: bytes | str, what: str = "参考序列") -> str:
+    """解析参考/片段序列上传内容，支持纯文本和单记录 FASTA。仅接受大写 ACGT。"""
     text = _decode(raw)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
-        raise ValidationError("参考序列为空。")
+        raise ValidationError(f"{what}为空。")
 
     is_fasta = any(line.startswith(">") for line in lines)
     if is_fasta:
         headers = [line for line in lines if line.startswith(">")]
         if len(headers) != 1:
-            raise ValidationError("FASTA 参考序列只能包含一条记录（仅允许一个 '>' 标题行）。")
+            raise ValidationError(f"FASTA {what}只能包含一条记录（仅允许一个 '>' 标题行）。")
         seq = "".join(line for line in lines if not line.startswith(">"))
     else:
         seq = "".join(lines)  # 去掉所有空白/换行
 
     if not seq:
-        raise ValidationError("参考序列为空。")
+        raise ValidationError(f"{what}为空。")
     bad = sorted(set(seq) - ACGT)
     if bad:
         raise ValidationError(
-            "参考序列只允许包含大写 A/C/G/T，发现非法字符：" + " ".join(bad[:10])
+            f"{what}只允许包含大写 A/C/G/T，发现非法字符：" + " ".join(bad[:10])
         )
     return seq
 
@@ -88,9 +95,10 @@ def validate_and_normalize(rows: list[dict], ref_seq: str) -> list[dict]:
     """逐行核对 REF、校验类型并左对齐归一化。
 
     归一化后若同一样本出现重复变异（同一规范坐标），整份文件拒绝。
+    行可携带 ``orig`` 字典（TSV 原始记录），此时返回的 orig_* 取自该字典，
+    用于片段坐标换算后仍保留 TSV 原记录。
     返回 [{pos, ref, alt, gt, orig_pos, orig_ref, orig_alt, kind}, ...]。
     """
-    genome_len = len(ref_seq)
     seen: dict[tuple, int] = {}
     result: list[dict] = []
 
@@ -98,32 +106,9 @@ def validate_and_normalize(rows: list[dict], ref_seq: str) -> list[dict]:
         lineno = row["lineno"]
         pos, ref, alt, gt = row["pos"], row["ref"], row["alt"], row["gt"]
 
-        if not ref or not alt:
-            raise ValidationError(f"第 {lineno} 行：REF/ALT 不能为空。")
-        if set(ref) - ACGT or set(alt) - ACGT:
-            raise ValidationError(f"第 {lineno} 行：REF/ALT 只允许大写 A/C/G/T。")
-        if gt not in VALID_GTS:
-            raise ValidationError(f"第 {lineno} 行：GT 只允许 0/1 或 1/1，收到 '{gt}'。")
-        if pos < 1:
-            raise ValidationError(f"第 {lineno} 行：POS 必须从 1 开始计数。")
-
-        kind = _classify(ref, alt, lineno)
-
-        end = pos + len(ref) - 1
-        if end > genome_len:
-            raise ValidationError(
-                f"第 {lineno} 行：变异结束位置 {end} 超出参考序列长度 {genome_len}。"
-            )
-        actual = ref_seq[pos - 1 : pos - 1 + len(ref)]
-        if actual != ref:
-            raise ValidationError(
-                f"第 {lineno} 行：REF 核对失败，参考序列 {pos}-{end} 位为 '{actual}'，上传为 '{ref}'。"
-            )
-
-        if kind == "INS" and alt[0] != ref:
-            raise ValidationError(f"第 {lineno} 行：插入的锚碱基必须与 REF 相同。")
-        if kind == "DEL" and ref[0] != alt:
-            raise ValidationError(f"第 {lineno} 行：缺失的锚碱基必须与 ALT 相同。")
+        kind = _check_row_fields(lineno, pos, ref, alt, gt)
+        _check_ref_match(ref_seq, pos, ref, lineno, "参考序列")
+        _check_anchor(kind, ref, alt, lineno)
 
         npos, nref, nalt = normalize_variant(pos, ref, alt, ref_seq)
         key = (npos, nref, nalt)
@@ -134,6 +119,7 @@ def validate_and_normalize(rows: list[dict], ref_seq: str) -> list[dict]:
             )
         seen[key] = lineno
 
+        orig = row.get("orig") or row
         result.append(
             {
                 "pos": npos,
@@ -141,9 +127,9 @@ def validate_and_normalize(rows: list[dict], ref_seq: str) -> list[dict]:
                 "alt": nalt,
                 "gt": gt,
                 "kind": kind,
-                "orig_pos": pos,
-                "orig_ref": ref,
-                "orig_alt": alt,
+                "orig_pos": orig["pos"],
+                "orig_ref": orig["ref"],
+                "orig_alt": orig["alt"],
             }
         )
     return result
@@ -192,8 +178,165 @@ def normalize_variant(pos: int, ref: str, alt: str, genome: str) -> tuple[int, s
 
 
 # --------------------------------------------------------------------------- #
+# 片段参考（按片段编号的 TSV）
+# --------------------------------------------------------------------------- #
+def locate_fragment(fragment: str, genome: str) -> tuple[int, int, str]:
+    """在全长参考上查找片段的正向/反向互补匹配。
+
+    只接受唯一的「位置 + 方向」组合；无匹配或匹配不唯一时抛出
+    ValidationError 并说明原因。返回 (start, end, strand)，
+    start/end 为片段在全长参考上的 1-based 闭区间，strand 为 '+' 或 '-'。
+    """
+    hits: list[tuple[int, str]] = []
+    for strand, needle in (("+", fragment), ("-", revcomp(fragment))):
+        start = 0
+        while True:
+            idx = genome.find(needle, start)
+            if idx < 0:
+                break
+            hits.append((idx + 1, strand))  # 1-based 起点
+            start = idx + 1  # 允许重叠匹配
+    if not hits:
+        raise ValidationError(
+            "片段参考在全长参考上无匹配（正向与反向互补均未找到），"
+            "请确认片段序列及其链方向。"
+        )
+    if len(hits) > 1:
+        shown = "、".join(
+            f"第 {pos} 位起（{'正向' if st == '+' else '反向'}）"
+            for pos, st in hits[:5]
+        )
+        more = "等" if len(hits) > 5 else ""
+        raise ValidationError(
+            f"片段参考在全长参考上的匹配不唯一，共 {len(hits)} 个位置/方向组合"
+            f"（{shown}{more}）；只接受唯一的位置和方向组合，请提供更长的片段。"
+        )
+    (start, strand), = hits
+    return start, start + len(fragment) - 1, strand
+
+
+def validate_and_normalize_fragment(
+    rows: list[dict], fragment: str, genome: str
+) -> tuple[list[dict], tuple[int, int, str]]:
+    """按片段坐标校验 TSV 行，换算为全长参考正向表示后归一化判重。
+
+    流程：定位片段（唯一正/反向匹配）-> 逐行按片段核对 REF 与范围 ->
+    换算为全长正向表示（反向匹配时插入/缺失保持左锚定，左锚可取自
+    片段外的相邻参考碱基）-> 沿用全长模式的归一化与判重规则。
+    任何一行失败都抛 ValidationError（含原文件行号），整份文件应被拒绝。
+
+    返回 (variants, (frag_start, frag_end, strand))。
+    """
+    frag_start, frag_end, strand = locate_fragment(fragment, genome)
+    converted: list[dict] = []
+
+    for row in rows:
+        lineno = row["lineno"]
+        pos, ref, alt, gt = row["pos"], row["ref"], row["alt"], row["gt"]
+
+        kind = _check_row_fields(lineno, pos, ref, alt, gt)
+        _check_ref_match(fragment, pos, ref, lineno, "片段")
+        _check_anchor(kind, ref, alt, lineno)
+
+        if strand == "+":
+            fpos, fref, falt = frag_start + pos - 1, ref, alt
+        else:
+            fpos, fref, falt = _to_forward_reverse(
+                pos, ref, alt, kind, frag_end, genome, lineno
+            )
+
+        converted.append(
+            {
+                "lineno": lineno,
+                "pos": fpos,
+                "ref": fref,
+                "alt": falt,
+                "gt": gt,
+                "orig": {"pos": pos, "ref": ref, "alt": alt},
+            }
+        )
+
+    variants = validate_and_normalize(converted, genome)
+    return variants, (frag_start, frag_end, strand)
+
+
+def _to_forward_reverse(
+    pos: int, ref: str, alt: str, kind: str, frag_end: int, genome: str, lineno: int
+) -> tuple[int, str, str]:
+    """把反向匹配片段上的一个变异换算为全长参考的正向表示。
+
+    片段（TSV 链方向）位置 j 对应全长正向位置 frag_end - j + 1（碱基互补）。
+    插入/缺失在片段上是左锚定的，反向换算后锚点落到事件右侧，因此统一
+    改写为全长上的左锚定形式：左锚碱基优先取片段内相邻碱基；变异锚定在
+    片段末端时，取片段外相邻的全长参考碱基；片段已对齐到参考起点、
+    取不到合法左锚时拒绝该行。
+    """
+    if kind == "SNP":
+        return frag_end - pos + 1, revcomp(ref), revcomp(alt)
+
+    if kind == "INS":
+        inserted = alt[1:]  # 片段上锚碱基之后插入的序列
+        anchor_pos = frag_end - pos  # 正向左锚位置（插入点之前一位）
+        if anchor_pos < 1:
+            raise _no_anchor_error(lineno)
+        anchor = genome[anchor_pos - 1]
+        return anchor_pos, anchor, anchor + revcomp(inserted)
+
+    # DEL：ref = 锚 + 缺失序列，换算后缺失段位于全长 [anchor_pos+1, ...]
+    deleted = ref[1:]
+    anchor_pos = frag_end - pos - len(ref) + 1
+    if anchor_pos < 1:
+        raise _no_anchor_error(lineno)
+    anchor = genome[anchor_pos - 1]
+    return anchor_pos, anchor + revcomp(deleted), anchor
+
+
+def _no_anchor_error(lineno: int) -> ValidationError:
+    return ValidationError(
+        f"第 {lineno} 行：片段反向匹配且变异锚定在片段末端，换算为全长正向"
+        f"表示时需要片段外的相邻参考碱基作为左锚，但片段已对齐到全长参考"
+        f"起点，无法取得合法左锚，该行被拒绝。"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # 内部工具
 # --------------------------------------------------------------------------- #
+def _check_row_fields(lineno: int, pos: int, ref: str, alt: str, gt: str) -> str:
+    """校验一行的基本字段（与坐标系无关），返回变异类型。"""
+    if not ref or not alt:
+        raise ValidationError(f"第 {lineno} 行：REF/ALT 不能为空。")
+    if set(ref) - ACGT or set(alt) - ACGT:
+        raise ValidationError(f"第 {lineno} 行：REF/ALT 只允许大写 A/C/G/T。")
+    if gt not in VALID_GTS:
+        raise ValidationError(f"第 {lineno} 行：GT 只允许 0/1 或 1/1，收到 '{gt}'。")
+    if pos < 1:
+        raise ValidationError(f"第 {lineno} 行：POS 必须从 1 开始计数。")
+    return _classify(ref, alt, lineno)
+
+
+def _check_ref_match(seq: str, pos: int, ref: str, lineno: int, label: str) -> None:
+    """核对 REF 与给定序列（全长参考或片段）一致，且范围不越界。"""
+    end = pos + len(ref) - 1
+    if end > len(seq):
+        raise ValidationError(
+            f"第 {lineno} 行：变异结束位置 {end} 超出{label}长度 {len(seq)}。"
+        )
+    actual = seq[pos - 1 : pos - 1 + len(ref)]
+    if actual != ref:
+        raise ValidationError(
+            f"第 {lineno} 行：REF 核对失败，{label} {pos}-{end} 位为 "
+            f"'{actual}'，上传为 '{ref}'。"
+        )
+
+
+def _check_anchor(kind: str, ref: str, alt: str, lineno: int) -> None:
+    if kind == "INS" and alt[0] != ref:
+        raise ValidationError(f"第 {lineno} 行：插入的锚碱基必须与 REF 相同。")
+    if kind == "DEL" and ref[0] != alt:
+        raise ValidationError(f"第 {lineno} 行：缺失的锚碱基必须与 ALT 相同。")
+
+
 def _classify(ref: str, alt: str, lineno: int) -> str:
     if len(ref) == 1 and len(alt) == 1:
         if ref == alt:

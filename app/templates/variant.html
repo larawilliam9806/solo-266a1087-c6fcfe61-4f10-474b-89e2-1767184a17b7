@@ -4,16 +4,24 @@
 <section class="card">
   <p><a href="{{ url_for('index') }}">← 返回汇总</a></p>
   <h2>规范变异 {{ variant.pos }} : {{ variant.ref }} → {{ variant.alt }}</h2>
-  <p class="hint">共 {{ variant.rows|length }} 个样本检出；下表保留每份 TSV 中书写的原始位点与等位基因。</p>
+  <p class="hint">共 {{ variant.rows|length }} 个样本检出；下表为入库的 TSV 原记录。
+    片段样本的「原始 POS/REF/ALT」按片段内坐标、TSV 所用链方向书写，并给出该版片段在全长参考上的位置与方向。</p>
   <table>
     <thead>
-      <tr><th>样本</th><th>基因型 (GT)</th><th>原始 POS</th><th>原始 REF</th><th>原始 ALT</th></tr>
+      <tr><th>样本</th><th>基因型 (GT)</th><th>坐标</th><th>原始 POS</th><th>原始 REF</th><th>原始 ALT</th></tr>
     </thead>
     <tbody>
     {% for r in variant.rows %}
       <tr>
         <td>{{ r.sample }}</td>
         <td class="mono">{{ r.gt }}</td>
+        <td>
+          {% if r.is_fragment %}
+            <span class="tag tag-kind">片段 {{ r.frag_start }}-{{ r.frag_end }}（{{ r.frag_strand }}）</span>
+          {% else %}
+            全长
+          {% endif %}
+        </td>
         <td>{{ r.orig_pos }}</td>
         <td class="mono">{{ r.orig_ref }}</td>
         <td class="mono">{{ r.orig_alt }}</td>
